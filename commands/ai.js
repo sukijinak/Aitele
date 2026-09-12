@@ -15,7 +15,7 @@ export function setupAiCommand(bot, sessions) {
 
     if (arg === "on") {
       sessions.set(userId, { isActive: true, lastInteraction: Date.now() });
-      await ctx.reply(" Mode AI berhasil **DIPIKIRKAN/DIAKTIFKAN**! Silakan kirim pesan atau pertanyaan kamu.", {
+      await ctx.reply(" Mode AI berhasil **DIAKTIFKAN**! Silakan kirim pesan atau pertanyaan kamu.", {
         reply_markup: getAiKeyboard(true),
       });
     } else if (arg === "off") {

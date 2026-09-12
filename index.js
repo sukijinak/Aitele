@@ -6,16 +6,19 @@ import path from "path";
 dotenv.config();
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const API_KEY = process.env.API_KEY;
-const MODEL_COMBO = process.env.MODEL_COMBO || "gpt-4o-mini";
+const API_KEY = process.env.API_KEY || "9router"; // Local CLI biasanya fleksibel
+const MODEL_COMBO = process.env.MODEL_COMBO || "ai";
 const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT || "1800000", 10);
 
-if (!BOT_TOKEN || !API_KEY) {
-  console.error(" Error: BOT_TOKEN dan API_KEY harus diisi di file .env!");
+// Endpoint 9Router Local Proxy (Sesuaikan port jika berbeda, default: 20128)
+const ROUTER_BASE_URL = process.env.ROUTER_BASE_URL || "http://127.0.0.1:20128/v1/chat/completions";
+
+if (!BOT_TOKEN) {
+  console.error("❌ Error: BOT_TOKEN harus diisi di file .env!");
   process.exit(1);
 }
 
-// Read system prompt file
+// Baca system prompt
 let systemPrompt = "Kamu adalah asisten AI yang ramah.";
 try {
   systemPrompt = fs.readFileSync(path.resolve("system-prompt.txt"), "utf-8").trim();
@@ -24,9 +27,9 @@ try {
 }
 
 const bot = new Bot(BOT_TOKEN);
-const userSessions = new Map(); // key: userId, value: { isActive, lastInteraction, lastAiMessageId }
+const userSessions = new Map();
 
-// Cleanup Session Timeout Sweep
+// Session Timeout Cleaner
 setInterval(() => {
   const now = Date.now();
   for (const [userId, session] of userSessions.entries()) {
@@ -34,13 +37,13 @@ setInterval(() => {
       userSessions.set(userId, { ...session, isActive: false });
       bot.api.sendMessage(
         userId,
-        " Sesi AI kamu udah berakhir karena 30 menit nggak ada aktivitas. Kirim `/ai on` buat ngobrol lagi ya!"
+        "⏳ Sesi AI kamu sudah berakhir karena 30 menit tidak ada aktivitas. Kirim `/ai on` untuk mulai lagi."
       ).catch(() => {});
     }
   }
-}, 60000); // Cek tiap 1 menit
+}, 60000);
 
-// Utility: Strip Markdown characters from response
+// Helper: Hapus karakter Markdown (*, _, `, ~, #, dll)
 function cleanMarkdown(text) {
   if (!text) return "";
   return text
@@ -49,9 +52,9 @@ function cleanMarkdown(text) {
     .trim();
 }
 
-// Utility: Call 9router OpenAI-Compatible API
+// Helper: Handshake ke 9Router (Support Normal JSON & Streaming Fallback)
 async function fetch9RouterAI(userPrompt) {
-  const response = await fetch("https://api.9router.com/v1/chat/completions", {
+  const response = await fetch(ROUTER_BASE_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -62,21 +65,47 @@ async function fetch9RouterAI(userPrompt) {
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt }
-      ]
+      ],
+      stream: false
     })
   });
 
   if (!response.ok) {
     const errText = await response.text();
-    throw new Error(`API 9router Error (${response.status}): ${errText}`);
+    throw new Error(`9Router Error (${response.status}): ${errText}`);
   }
 
-  const data = await response.json();
-  const rawOutput = data.choices?.[0]?.message?.content || "Maaf, AI tidak memberikan respons.";
-  return cleanMarkdown(rawOutput);
+  const rawText = await response.text();
+  let content = "";
+
+  // Handle jika response yang kembali berupa Streaming (SSE)
+  if (rawText.startsWith("data:")) {
+    const lines = rawText.split("\n");
+    for (const line of lines) {
+      if (line.startsWith("data:") && !line.includes("[DONE]")) {
+        try {
+          const json = JSON.parse(line.replace(/^data:\s*/, ""));
+          const chunk = json.choices?.[0]?.delta?.content || json.choices?.[0]?.text || "";
+          content += chunk;
+        } catch (e) {
+          // Skip malformed chunk
+        }
+      }
+    }
+  } else {
+    // Standard JSON Response
+    const data = JSON.parse(rawText);
+    content = data.choices?.[0]?.message?.content || "";
+  }
+
+  if (!content) {
+    content = "Maaf, AI tidak memberikan respons.";
+  }
+
+  return cleanMarkdown(content);
 }
 
-// Dynamic Command Registration
+// Import Command Handlers
 import { setupStartCommand } from "./commands/start.js";
 import { setupHelpCommand } from "./commands/help.js";
 import { setupAiCommand } from "./commands/ai.js";
@@ -85,7 +114,7 @@ setupStartCommand(bot);
 setupHelpCommand(bot);
 setupAiCommand(bot, userSessions);
 
-// Middleware/Handler for Text Messages & Edits
+// Core Message Handler (Handle edit & fresh message)
 async function handleUserMessage(ctx, isEdit = false) {
   const userId = ctx.from?.id;
   const text = ctx.message?.text || ctx.editedMessage?.text;
@@ -94,30 +123,27 @@ async function handleUserMessage(ctx, isEdit = false) {
 
   const session = userSessions.get(userId);
 
-  // Validation: Check active session & timeout
   if (!session || !session.isActive) {
-    if (isEdit) return; // Ignore edits if session is inactive
-    const keyboard = new InlineKeyboard().text(" Nyalakan AI", "ai_on");
-    return ctx.reply(" Mode AI kamu belum aktif. Klik tombol di bawah atau ketik `/ai on` untuk mulai ngobrol!", {
+    if (isEdit) return;
+    const keyboard = new InlineKeyboard().text("⚡ Nyalakan AI", "ai_on");
+    return ctx.reply("Mode AI belum aktif. Ketik `/ai on` atau tekan tombol di bawah:", {
       reply_markup: keyboard,
     });
   }
 
-  // Update last interaction timestamp
   session.lastInteraction = Date.now();
   userSessions.set(userId, session);
 
-  // Send initial indicator
   let tempMessage;
   try {
     if (isEdit && session.lastAiMessageId) {
       await ctx.api.editMessageText(
         ctx.chat.id,
         session.lastAiMessageId,
-        " AI lagi mikirin jawaban baru untuk pesan yang diedit..."
+        "🔄 Memproses ulang pesan yang diedit..."
       );
     } else {
-      tempMessage = await ctx.reply(" AI lagi mikir...");
+      tempMessage = await ctx.reply("⏳ Memproses jawaban...");
     }
 
     const aiResponse = await fetch9RouterAI(text);
@@ -131,28 +157,26 @@ async function handleUserMessage(ctx, isEdit = false) {
     }
   } catch (error) {
     console.error("AI Handling Error:", error);
-    const errorText = " Waduh, maaf ya! Ada gangguan pas nyoba dapet respons dari AI. Coba lagi beberapa saat lagi.";
+    const errorText = "❌ Gagal mengambil respons dari 9Router Lokal. Pastikan CLI/Server 9Router sudah berjalan.";
     
-    if (tempMessage) {
+    if (isEdit && session.lastAiMessageId) {
+      await ctx.api.editMessageText(ctx.chat.id, session.lastAiMessageId, errorText).catch(() => {});
+    } else if (tempMessage) {
       await ctx.api.editMessageText(ctx.chat.id, tempMessage.message_id, errorText).catch(() => {});
-    } else {
-      await ctx.reply(errorText).catch(() => {});
     }
   }
 }
 
-// Listen to new messages and edits
+// Event Listeners
 bot.on("message:text", (ctx) => handleUserMessage(ctx, false));
 bot.on("edited_message:text", (ctx) => handleUserMessage(ctx, true));
 
-// Error handling to prevent crash
 bot.catch((err) => {
   console.error("Bot Error Captured:", err.error);
 });
 
-// Start bot
 bot.start({
   onStart: (botInfo) => {
-    console.log(` Bot ready! Logged in as @${botInfo.username}`);
+    console.log(`🤖 Bot siap! Login sebagai @${botInfo.username}`);
   },
 });
